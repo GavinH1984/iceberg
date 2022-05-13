@@ -26,9 +26,11 @@ import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.ManifestEntry.Status;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Types;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -420,6 +422,37 @@ public class TestTransaction extends TableTestBase {
   }
 
   @Test
+  public void testTransactionRetrySchemaUpdate() {
+    // use only one retry
+    table.updateProperties()
+        .set(TableProperties.COMMIT_NUM_RETRIES, "1")
+        .commit();
+
+    // start a transaction
+    Transaction txn = table.newTransaction();
+    // add column "new-column"
+    txn.updateSchema()
+        .addColumn("new-column", Types.IntegerType.get())
+        .commit();
+    int schemaId = txn.table().schema().schemaId();
+
+    // directly update the table for adding "another-column" (which causes in-progress txn commit fail)
+    table.updateSchema()
+        .addColumn("another-column", Types.IntegerType.get())
+        .commit();
+    int conflictingSchemaId = table.schema().schemaId();
+
+    Assert.assertEquals("Both schema IDs should be the same in order to cause a conflict",
+        conflictingSchemaId,
+        schemaId);
+
+    // commit the transaction for adding "new-column"
+    AssertHelpers.assertThrows("Should fail due to conflicting transaction even after retry",
+        CommitFailedException.class, "Table metadata refresh is required",
+        txn::commitTransaction);
+  }
+
+  @Test
   public void testTransactionRetryMergeCleanup() {
     // use only one retry and aggressively merge manifests
     table.updateProperties()
@@ -698,5 +731,27 @@ public class TestTransaction extends TableTestBase {
         .commit();
 
     Assert.assertFalse("Append manifest should be deleted on expiry", new File(newManifest.path()).exists());
+  }
+
+  @Test
+  public void testSimpleTransactionNotDeletingMetadataOnUnknownSate() throws IOException {
+    Table table = TestTables.tableWithCommitSucceedButStateUnknown(tableDir, "test");
+
+    Transaction transaction = table.newTransaction();
+    transaction.newAppend()
+        .appendFile(FILE_A)
+        .commit();
+
+    AssertHelpers.assertThrows(
+        "Transaction commit should fail with CommitStateUnknownException",
+        CommitStateUnknownException.class, "datacenter on fire",
+        () -> transaction.commitTransaction());
+
+    // Make sure metadata files still exist
+    Snapshot current = table.currentSnapshot();
+    List<ManifestFile> manifests = current.allManifests();
+    Assert.assertEquals("Should have 1 manifest file", 1, manifests.size());
+    Assert.assertTrue("Manifest file should exist", new File(manifests.get(0).path()).exists());
+    Assert.assertEquals("Should have 2 files in metadata", 2, countAllMetadataFiles(tableDir));
   }
 }

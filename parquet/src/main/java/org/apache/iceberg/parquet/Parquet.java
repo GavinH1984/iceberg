@@ -82,6 +82,8 @@ import static org.apache.iceberg.TableProperties.DELETE_PARQUET_COMPRESSION;
 import static org.apache.iceberg.TableProperties.DELETE_PARQUET_COMPRESSION_LEVEL;
 import static org.apache.iceberg.TableProperties.DELETE_PARQUET_DICT_SIZE_BYTES;
 import static org.apache.iceberg.TableProperties.DELETE_PARQUET_PAGE_SIZE_BYTES;
+import static org.apache.iceberg.TableProperties.DELETE_PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT;
+import static org.apache.iceberg.TableProperties.DELETE_PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT;
 import static org.apache.iceberg.TableProperties.DELETE_PARQUET_ROW_GROUP_SIZE_BYTES;
 import static org.apache.iceberg.TableProperties.PARQUET_COMPRESSION;
 import static org.apache.iceberg.TableProperties.PARQUET_COMPRESSION_DEFAULT;
@@ -91,6 +93,10 @@ import static org.apache.iceberg.TableProperties.PARQUET_DICT_SIZE_BYTES;
 import static org.apache.iceberg.TableProperties.PARQUET_DICT_SIZE_BYTES_DEFAULT;
 import static org.apache.iceberg.TableProperties.PARQUET_PAGE_SIZE_BYTES;
 import static org.apache.iceberg.TableProperties.PARQUET_PAGE_SIZE_BYTES_DEFAULT;
+import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT;
+import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT_DEFAULT;
+import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT;
+import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT_DEFAULT;
 import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES;
 import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT;
 
@@ -107,6 +113,7 @@ public class Parquet {
 
   public static class WriteBuilder {
     private final OutputFile file;
+    private final Configuration conf;
     private final Map<String, String> metadata = Maps.newLinkedHashMap();
     private final Map<String, String> config = Maps.newLinkedHashMap();
     private Schema schema = null;
@@ -120,12 +127,17 @@ public class Parquet {
 
     private WriteBuilder(OutputFile file) {
       this.file = file;
+      if (file instanceof HadoopOutputFile) {
+        this.conf = new Configuration(((HadoopOutputFile) file).getConf());
+      } else {
+        this.conf = new Configuration();
+      }
     }
 
     public WriteBuilder forTable(Table table) {
       schema(table.schema());
       setAll(table.properties());
-      metricsConfig(MetricsConfig.fromProperties(table.properties()));
+      metricsConfig(MetricsConfig.forTable(table));
       return this;
     }
 
@@ -225,6 +237,8 @@ public class Parquet {
       int dictionaryPageSize = context.dictionaryPageSize();
       String compressionLevel = context.compressionLevel();
       CompressionCodecName codec = context.codec();
+      int rowGroupCheckMinRecordCount = context.rowGroupCheckMinRecordCount();
+      int rowGroupCheckMaxRecordCount = context.rowGroupCheckMaxRecordCount();
 
       if (compressionLevel != null) {
         switch (codec) {
@@ -235,7 +249,9 @@ public class Parquet {
             config.put("compression.brotli.quality", compressionLevel);
             break;
           case ZSTD:
+            // keep "io.compression.codec.zstd.level" for backwards compatibility
             config.put("io.compression.codec.zstd.level", compressionLevel);
+            config.put("parquet.compression.codec.zstd.level", compressionLevel);
             break;
           default:
             // compression level is not supported; ignore it
@@ -248,12 +264,6 @@ public class Parquet {
       if (createWriterFunc != null) {
         Preconditions.checkArgument(writeSupport == null,
             "Cannot write with both write support and Parquet value writer");
-        Configuration conf;
-        if (file instanceof HadoopOutputFile) {
-          conf = ((HadoopOutputFile) file).getConf();
-        } else {
-          conf = new Configuration();
-        }
 
         for (Map.Entry<String, String> entry : config.entrySet()) {
           conf.set(entry.getKey(), entry.getValue());
@@ -263,6 +273,8 @@ public class Parquet {
             .withWriterVersion(writerVersion)
             .withPageSize(pageSize)
             .withDictionaryPageSize(dictionaryPageSize)
+            .withMinRowCountForPageSizeCheck(rowGroupCheckMinRecordCount)
+            .withMaxRowCountForPageSizeCheck(rowGroupCheckMaxRecordCount)
             .build();
 
         return new org.apache.iceberg.parquet.ParquetWriter<>(
@@ -291,32 +303,53 @@ public class Parquet {
       private final int dictionaryPageSize;
       private final CompressionCodecName codec;
       private final String compressionLevel;
+      private final int rowGroupCheckMinRecordCount;
+      private final int rowGroupCheckMaxRecordCount;
 
       private Context(int rowGroupSize, int pageSize, int dictionaryPageSize,
-                      CompressionCodecName codec, String compressionLevel) {
+                      CompressionCodecName codec, String compressionLevel,
+                      int rowGroupCheckMinRecordCount, int rowGroupCheckMaxRecordCount) {
         this.rowGroupSize = rowGroupSize;
         this.pageSize = pageSize;
         this.dictionaryPageSize = dictionaryPageSize;
         this.codec = codec;
         this.compressionLevel = compressionLevel;
+        this.rowGroupCheckMinRecordCount = rowGroupCheckMinRecordCount;
+        this.rowGroupCheckMaxRecordCount = rowGroupCheckMaxRecordCount;
       }
 
       static Context dataContext(Map<String, String> config) {
-        int rowGroupSize = Integer.parseInt(config.getOrDefault(
-            PARQUET_ROW_GROUP_SIZE_BYTES, PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT));
+        int rowGroupSize = PropertyUtil.propertyAsInt(config,
+            PARQUET_ROW_GROUP_SIZE_BYTES, PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT);
+        Preconditions.checkArgument(rowGroupSize > 0, "Row group size must be > 0");
 
-        int pageSize = Integer.parseInt(config.getOrDefault(
-            PARQUET_PAGE_SIZE_BYTES, PARQUET_PAGE_SIZE_BYTES_DEFAULT));
+        int pageSize = PropertyUtil.propertyAsInt(config,
+            PARQUET_PAGE_SIZE_BYTES, PARQUET_PAGE_SIZE_BYTES_DEFAULT);
+        Preconditions.checkArgument(pageSize > 0, "Page size must be > 0");
 
-        int dictionaryPageSize = Integer.parseInt(config.getOrDefault(
-            PARQUET_DICT_SIZE_BYTES, PARQUET_DICT_SIZE_BYTES_DEFAULT));
+        int dictionaryPageSize = PropertyUtil.propertyAsInt(config,
+            PARQUET_DICT_SIZE_BYTES, PARQUET_DICT_SIZE_BYTES_DEFAULT);
+        Preconditions.checkArgument(dictionaryPageSize > 0, "Dictionary page size must be > 0");
 
         String codecAsString = config.getOrDefault(PARQUET_COMPRESSION, PARQUET_COMPRESSION_DEFAULT);
         CompressionCodecName codec = toCodec(codecAsString);
 
         String compressionLevel = config.getOrDefault(PARQUET_COMPRESSION_LEVEL, PARQUET_COMPRESSION_LEVEL_DEFAULT);
 
-        return new Context(rowGroupSize, pageSize, dictionaryPageSize, codec, compressionLevel);
+        int rowGroupCheckMinRecordCount = PropertyUtil.propertyAsInt(config,
+            PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT, PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT_DEFAULT);
+        Preconditions.checkArgument(rowGroupCheckMinRecordCount > 0,
+            "Row group check minimal record count must be > 0");
+
+        int rowGroupCheckMaxRecordCount = PropertyUtil.propertyAsInt(config,
+            PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT, PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT_DEFAULT);
+        Preconditions.checkArgument(rowGroupCheckMaxRecordCount > 0,
+            "Row group check maximum record count must be > 0");
+        Preconditions.checkArgument(rowGroupCheckMaxRecordCount >= rowGroupCheckMinRecordCount,
+            "Row group check maximum record count must be >= minimal record count");
+
+        return new Context(rowGroupSize, pageSize, dictionaryPageSize, codec, compressionLevel,
+            rowGroupCheckMinRecordCount, rowGroupCheckMaxRecordCount);
       }
 
       static Context deleteContext(Map<String, String> config) {
@@ -325,19 +358,35 @@ public class Parquet {
 
         int rowGroupSize = PropertyUtil.propertyAsInt(config,
             DELETE_PARQUET_ROW_GROUP_SIZE_BYTES, dataContext.rowGroupSize());
+        Preconditions.checkArgument(rowGroupSize > 0, "Row group size must be > 0");
 
         int pageSize = PropertyUtil.propertyAsInt(config,
             DELETE_PARQUET_PAGE_SIZE_BYTES, dataContext.pageSize());
+        Preconditions.checkArgument(pageSize > 0, "Page size must be > 0");
 
         int dictionaryPageSize = PropertyUtil.propertyAsInt(config,
             DELETE_PARQUET_DICT_SIZE_BYTES, dataContext.dictionaryPageSize());
+        Preconditions.checkArgument(dictionaryPageSize > 0, "Dictionary page size must be > 0");
 
         String codecAsString = config.get(DELETE_PARQUET_COMPRESSION);
         CompressionCodecName codec = codecAsString != null ? toCodec(codecAsString) : dataContext.codec();
 
         String compressionLevel = config.getOrDefault(DELETE_PARQUET_COMPRESSION_LEVEL, dataContext.compressionLevel());
 
-        return new Context(rowGroupSize, pageSize, dictionaryPageSize, codec, compressionLevel);
+        int rowGroupCheckMinRecordCount = PropertyUtil.propertyAsInt(config,
+            DELETE_PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT, dataContext.rowGroupCheckMinRecordCount());
+        Preconditions.checkArgument(rowGroupCheckMinRecordCount > 0,
+            "Row group check minimal record count must be > 0");
+
+        int rowGroupCheckMaxRecordCount = PropertyUtil.propertyAsInt(config,
+            DELETE_PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT, dataContext.rowGroupCheckMaxRecordCount());
+        Preconditions.checkArgument(rowGroupCheckMaxRecordCount > 0,
+            "Row group check maximum record count must be > 0");
+        Preconditions.checkArgument(rowGroupCheckMaxRecordCount >= rowGroupCheckMinRecordCount,
+            "Row group check maximum record count must be >= minimal record count");
+
+        return new Context(rowGroupSize, pageSize, dictionaryPageSize, codec, compressionLevel,
+            rowGroupCheckMinRecordCount, rowGroupCheckMaxRecordCount);
       }
 
       private static CompressionCodecName toCodec(String codecAsString) {
@@ -367,6 +416,14 @@ public class Parquet {
       String compressionLevel() {
         return compressionLevel;
       }
+
+      int rowGroupCheckMinRecordCount() {
+        return rowGroupCheckMinRecordCount;
+      }
+
+      int rowGroupCheckMaxRecordCount() {
+        return rowGroupCheckMaxRecordCount;
+      }
     }
   }
 
@@ -391,7 +448,7 @@ public class Parquet {
       schema(table.schema());
       withSpec(table.spec());
       setAll(table.properties());
-      metricsConfig(MetricsConfig.fromProperties(table.properties()));
+      metricsConfig(MetricsConfig.forTable(table));
       return this;
     }
 
@@ -489,7 +546,7 @@ public class Parquet {
       rowSchema(table.schema());
       withSpec(table.spec());
       setAll(table.properties());
-      metricsConfig(MetricsConfig.fromProperties(table.properties()));
+      metricsConfig(MetricsConfig.forTable(table));
       return this;
     }
 
@@ -518,7 +575,6 @@ public class Parquet {
     }
 
     public DeleteWriteBuilder metricsConfig(MetricsConfig newMetricsConfig) {
-      // TODO: keep full metrics for position delete file columns
       appenderBuilder.metricsConfig(newMetricsConfig);
       return this;
     }
@@ -569,7 +625,7 @@ public class Parquet {
     }
 
     public <T> EqualityDeleteWriter<T> buildEqualityWriter() throws IOException {
-      Preconditions.checkState(rowSchema != null, "Cannot create equality delete file without a schema`");
+      Preconditions.checkState(rowSchema != null, "Cannot create equality delete file without a schema");
       Preconditions.checkState(equalityFieldIds != null, "Cannot create equality delete file without delete field ids");
       Preconditions.checkState(createWriterFunc != null,
           "Cannot create equality delete file unless createWriterFunc is set");
@@ -595,10 +651,11 @@ public class Parquet {
 
     public <T> PositionDeleteWriter<T> buildPositionWriter() throws IOException {
       Preconditions.checkState(equalityFieldIds == null, "Cannot create position delete file using delete field ids");
-      Preconditions.checkArgument(spec != null,
-          "Spec must not be null when creating position delete writer");
+      Preconditions.checkArgument(spec != null, "Spec must not be null when creating position delete writer");
       Preconditions.checkArgument(spec.isUnpartitioned() || partition != null,
           "Partition must not be null for partitioned writes");
+      Preconditions.checkArgument(rowSchema == null || createWriterFunc != null,
+          "Create function should be provided if we write row data");
 
       meta("delete-type", "position");
 
@@ -618,6 +675,7 @@ public class Parquet {
       } else {
         appenderBuilder.schema(DeleteSchemaUtil.pathPosSchema());
 
+        // We ignore the 'createWriterFunc' and 'rowSchema' even if is provided, since we do not write row data itself
         appenderBuilder.createWriterFunc(parquetSchema ->
             new PositionDeleteStructWriter<T>((StructWriter<?>) GenericParquetWriter.buildWriter(parquetSchema),
                 Function.identity()));

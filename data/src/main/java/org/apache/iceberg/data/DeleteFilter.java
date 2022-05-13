@@ -25,21 +25,23 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 import org.apache.iceberg.Accessor;
-import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
-import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.data.avro.DataReader;
+import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.deletes.Deletes;
+import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -52,7 +54,6 @@ import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Filter;
 import org.apache.iceberg.util.StructLikeSet;
 import org.apache.iceberg.util.StructProjection;
-import org.apache.parquet.Preconditions;
 
 public abstract class DeleteFilter<T> {
   private static final long DEFAULT_SET_FILTER_THRESHOLD = 100_000L;
@@ -61,19 +62,22 @@ public abstract class DeleteFilter<T> {
       MetadataColumns.DELETE_FILE_POS);
 
   private final long setFilterThreshold;
-  private final DataFile dataFile;
+  private final String filePath;
   private final List<DeleteFile> posDeletes;
   private final List<DeleteFile> eqDeletes;
   private final Schema requiredSchema;
   private final Accessor<StructLike> posAccessor;
 
-  protected DeleteFilter(FileScanTask task, Schema tableSchema, Schema requestedSchema) {
+  private PositionDeleteIndex deleteRowPositions = null;
+  private Predicate<T> eqDeleteRows = null;
+
+  protected DeleteFilter(String filePath, List<DeleteFile> deletes, Schema tableSchema, Schema requestedSchema) {
     this.setFilterThreshold = DEFAULT_SET_FILTER_THRESHOLD;
-    this.dataFile = task.file();
+    this.filePath = filePath;
 
     ImmutableList.Builder<DeleteFile> posDeleteBuilder = ImmutableList.builder();
     ImmutableList.Builder<DeleteFile> eqDeleteBuilder = ImmutableList.builder();
-    for (DeleteFile delete : task.deletes()) {
+    for (DeleteFile delete : deletes) {
       switch (delete.content()) {
         case POSITION_DELETES:
           posDeleteBuilder.add(delete);
@@ -94,6 +98,14 @@ public abstract class DeleteFilter<T> {
 
   public Schema requiredSchema() {
     return requiredSchema;
+  }
+
+  public boolean hasPosDeletes() {
+    return !posDeletes.isEmpty();
+  }
+
+  public boolean hasEqDeletes() {
+    return !eqDeletes.isEmpty();
   }
 
   Accessor<StructLike> posAccessor() {
@@ -134,9 +146,14 @@ public abstract class DeleteFilter<T> {
 
       Iterable<CloseableIterable<Record>> deleteRecords = Iterables.transform(deletes,
           delete -> openDeletes(delete, deleteSchema));
+
+      // copy the delete records because they will be held in a set
+      CloseableIterable<Record> records = CloseableIterable.transform(
+          CloseableIterable.concat(deleteRecords), Record::copy);
+
       StructLikeSet deleteSet = Deletes.toEqualitySet(
-          // copy the delete records because they will be held in a set
-          CloseableIterable.transform(CloseableIterable.concat(deleteRecords), Record::copy),
+          CloseableIterable.transform(
+              records, record -> new InternalRecordWrapper(deleteSchema.asStruct()).wrap(record)),
           deleteSchema.asStruct());
 
       Predicate<T> isInDeleteSet = record -> deleteSet.contains(projectRow.wrap(asStructLike(record)));
@@ -178,6 +195,28 @@ public abstract class DeleteFilter<T> {
     return remainingRowsFilter.filter(records);
   }
 
+  public Predicate<T> eqDeletedRowFilter() {
+    if (eqDeleteRows == null) {
+      eqDeleteRows = applyEqDeletes().stream()
+          .map(Predicate::negate)
+          .reduce(Predicate::and)
+          .orElse(t -> true);
+    }
+    return eqDeleteRows;
+  }
+
+  public PositionDeleteIndex deletedRowPositions() {
+    if (posDeletes.isEmpty()) {
+      return null;
+    }
+
+    if (deleteRowPositions == null) {
+      List<CloseableIterable<Record>> deletes = Lists.transform(posDeletes, this::openPosDeletes);
+      deleteRowPositions = Deletes.toPositionIndex(filePath, deletes);
+    }
+    return deleteRowPositions;
+  }
+
   private CloseableIterable<T> applyPosDeletes(CloseableIterable<T> records) {
     if (posDeletes.isEmpty()) {
       return records;
@@ -187,12 +226,10 @@ public abstract class DeleteFilter<T> {
 
     // if there are fewer deletes than a reasonable number to keep in memory, use a set
     if (posDeletes.stream().mapToLong(DeleteFile::recordCount).sum() < setFilterThreshold) {
-      return Deletes.filter(
-          records, this::pos,
-          Deletes.toPositionSet(dataFile.path(), CloseableIterable.concat(deletes)));
+      return Deletes.filter(records, this::pos, Deletes.toPositionIndex(filePath, deletes));
     }
 
-    return Deletes.streamingFilter(records, this::pos, Deletes.deletePositions(dataFile.path(), deletes));
+    return Deletes.streamingFilter(records, this::pos, Deletes.deletePositions(filePath, deletes));
   }
 
   private CloseableIterable<Record> openPosDeletes(DeleteFile file) {
@@ -216,12 +253,22 @@ public abstract class DeleteFilter<T> {
             .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(deleteSchema, fileSchema));
 
         if (deleteFile.content() == FileContent.POSITION_DELETES) {
-          builder.filter(Expressions.equal(MetadataColumns.DELETE_FILE_PATH.name(), dataFile.path()));
+          builder.filter(Expressions.equal(MetadataColumns.DELETE_FILE_PATH.name(), filePath));
         }
 
         return builder.build();
 
       case ORC:
+        // Reusing containers is automatic for ORC. No need to set 'reuseContainers' here.
+        ORC.ReadBuilder orcBuilder = ORC.read(input)
+            .project(deleteSchema)
+            .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(deleteSchema, fileSchema));
+
+        if (deleteFile.content() == FileContent.POSITION_DELETES) {
+          orcBuilder.filter(Expressions.equal(MetadataColumns.DELETE_FILE_PATH.name(), filePath));
+        }
+
+        return orcBuilder.build();
       default:
         throw new UnsupportedOperationException(String.format(
             "Cannot read deletes, %s is not a supported format: %s", deleteFile.format().name(), deleteFile.path()));

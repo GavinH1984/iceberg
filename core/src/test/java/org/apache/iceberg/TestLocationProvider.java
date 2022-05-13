@@ -19,8 +19,10 @@
 
 package org.apache.iceberg;
 
+import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.io.LocationProvider;
+import org.apache.iceberg.relocated.com.google.common.base.Splitter;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -114,7 +116,7 @@ public class TestLocationProvider extends TableTestBase {
   @Test
   public void testDefaultLocationProviderWithCustomDataLocation() {
     this.table.updateProperties()
-        .set(TableProperties.WRITE_FOLDER_STORAGE_LOCATION, "new_location")
+        .set(TableProperties.WRITE_DATA_LOCATION, "new_location")
         .commit();
 
     this.table.locationProvider().newDataLocation("my_file");
@@ -237,5 +239,56 @@ public class TestLocationProvider extends TableTestBase {
 
     Assert.assertTrue("object storage path should be used when set",
         table.locationProvider().newDataLocation("file").contains(objectPath));
+
+    String dataPath = "s3://random/data/location";
+    table.updateProperties()
+        .set(TableProperties.WRITE_DATA_LOCATION, dataPath)
+        .commit();
+
+    Assert.assertTrue("write data path should be used when set",
+        table.locationProvider().newDataLocation("file").contains(dataPath));
+  }
+
+  @Test
+  public void testDefaultStorageLocationProviderPathResolution() {
+    table.updateProperties()
+        .set(TableProperties.OBJECT_STORE_ENABLED, "false")
+        .commit();
+
+    Assert.assertTrue("default data location should be used when object storage path not set",
+        table.locationProvider().newDataLocation("file").contains(table.location() + "/data"));
+
+    String folderPath = "s3://random/folder/location";
+    table.updateProperties()
+        .set(TableProperties.WRITE_FOLDER_STORAGE_LOCATION, folderPath)
+        .commit();
+
+    Assert.assertTrue("folder storage path should be used when set",
+        table.locationProvider().newDataLocation("file").contains(folderPath));
+
+    String dataPath = "s3://random/data/location";
+    table.updateProperties()
+        .set(TableProperties.WRITE_DATA_LOCATION, dataPath)
+        .commit();
+
+    Assert.assertTrue("write data path should be used when set",
+        table.locationProvider().newDataLocation("file").contains(dataPath));
+  }
+
+  @Test
+  public void testObjectStorageWithinTableLocation() {
+    table.updateProperties()
+        .set(TableProperties.OBJECT_STORE_ENABLED, "true")
+        .commit();
+
+    String fileLocation = table.locationProvider().newDataLocation("test.parquet");
+    String relativeLocation = fileLocation.replaceFirst(table.location(), "");
+    List<String> parts = Splitter.on("/").splitToList(relativeLocation);
+
+    Assert.assertEquals("Should contain 4 parts", 4, parts.size());
+    Assert.assertTrue("First part should be empty", parts.get(0).isEmpty());
+    Assert.assertEquals("Second part should be data", "data", parts.get(1));
+    Assert.assertFalse("Third part should be a hash value", parts.get(2).isEmpty());
+    Assert.assertEquals("Fourth part should be the file name passed in", "test.parquet", parts.get(3));
   }
 }

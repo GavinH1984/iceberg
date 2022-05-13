@@ -32,9 +32,10 @@ BUILD:
   - "**/*gradle*"
   - versions.props
 DOCS:
-  - site/**/*
+  - docs/**/*
   - "**/*CHANGELOG.md"
   - "**/*README.md"
+  - "**/*CONTRIBUTING.md"
 EXAMPLES:
   - examples/**/*
 COMMON:
@@ -45,6 +46,7 @@ CORE:
   - core/**/*
 PYTHON:
   - python/**/*
+  - python_legacy/**/*
 PARQUET:
   - parquet/**/*
 ARROW:
@@ -75,3 +77,9 @@ AWS:
   - aws/**/*
 NESSIE:
   - nessie/**/*
+ALIYUN:
+  - aliyun/**/*
+GCP:
+  - gcp/**/*
+DELL:
+  - dell/**/*

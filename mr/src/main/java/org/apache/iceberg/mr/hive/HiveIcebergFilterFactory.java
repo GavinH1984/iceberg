@@ -46,7 +46,6 @@ import static org.apache.iceberg.expressions.Expressions.lessThanOrEqual;
 import static org.apache.iceberg.expressions.Expressions.not;
 import static org.apache.iceberg.expressions.Expressions.or;
 
-
 public class HiveIcebergFilterFactory {
 
   private HiveIcebergFilterFactory() {
@@ -130,7 +129,7 @@ public class HiveIcebergFilterFactory {
       case FLOAT:
         return leaf.getLiteral();
       case DATE:
-        if (leaf.getLiteral() instanceof java.sql.Date) {
+        if (leaf.getLiteral() instanceof Date) {
           return daysFromDate((Date) leaf.getLiteral());
         }
         return daysFromTimestamp((Timestamp) leaf.getLiteral());

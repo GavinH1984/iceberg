@@ -30,16 +30,35 @@ public class MetadataTableUtils {
     return MetadataTableType.from(identifier.name()) != null;
   }
 
+  public static Table createMetadataTableInstance(Table table, MetadataTableType type) {
+    if (table instanceof BaseTable) {
+      TableOperations ops = ((BaseTable) table).operations();
+      return createMetadataTableInstance(ops, table, metadataTableName(table.name(), type), type);
+    } else {
+      throw new IllegalArgumentException(String.format(
+          "Cannot create metadata table for table %s: not a base table", table));
+    }
+  }
+
   public static Table createMetadataTableInstance(TableOperations ops,
                                                   String baseTableName,
                                                   String metadataTableName,
                                                   MetadataTableType type) {
     Table baseTable = new BaseTable(ops, baseTableName);
+    return createMetadataTableInstance(ops, baseTable, metadataTableName, type);
+  }
+
+  private static Table createMetadataTableInstance(TableOperations ops, Table baseTable, String metadataTableName,
+                                                   MetadataTableType type) {
     switch (type) {
       case ENTRIES:
         return new ManifestEntriesTable(ops, baseTable, metadataTableName);
       case FILES:
+        return new FilesTable(ops, baseTable, metadataTableName);
+      case DATA_FILES:
         return new DataFilesTable(ops, baseTable, metadataTableName);
+      case DELETE_FILES:
+        return new DeleteFilesTable(ops, baseTable, metadataTableName);
       case HISTORY:
         return new HistoryTable(ops, baseTable, metadataTableName);
       case SNAPSHOTS:
@@ -50,6 +69,10 @@ public class MetadataTableUtils {
         return new PartitionsTable(ops, baseTable, metadataTableName);
       case ALL_DATA_FILES:
         return new AllDataFilesTable(ops, baseTable, metadataTableName);
+      case ALL_DELETE_FILES:
+        return new AllDeleteFilesTable(ops, baseTable, metadataTableName);
+      case ALL_FILES:
+        return new AllFilesTable(ops, baseTable, metadataTableName);
       case ALL_MANIFESTS:
         return new AllManifestsTable(ops, baseTable, metadataTableName);
       case ALL_ENTRIES:
@@ -67,5 +90,9 @@ public class MetadataTableUtils {
     String baseTableName = BaseMetastoreCatalog.fullTableName(catalogName, baseTableIdentifier);
     String metadataTableName = BaseMetastoreCatalog.fullTableName(catalogName, metadataTableIdentifier);
     return createMetadataTableInstance(ops, baseTableName, metadataTableName, type);
+  }
+
+  private static String metadataTableName(String tableName, MetadataTableType type) {
+    return tableName + (tableName.contains("/") ? "#" : ".") + type;
   }
 }

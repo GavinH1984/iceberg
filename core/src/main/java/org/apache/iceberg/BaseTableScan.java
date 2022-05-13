@@ -19,24 +19,25 @@
 
 package org.apache.iceberg;
 
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.events.ScanEvent;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.ExpressionUtil;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.TypeUtil;
+import org.apache.iceberg.util.DateTimeUtil;
+import org.apache.iceberg.util.PropertyUtil;
+import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.iceberg.util.TableScanUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,8 +47,6 @@ import org.slf4j.LoggerFactory;
  */
 abstract class BaseTableScan implements TableScan {
   private static final Logger LOG = LoggerFactory.getLogger(BaseTableScan.class);
-
-  private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
   private final TableOperations ops;
   private final Table table;
@@ -69,6 +68,10 @@ abstract class BaseTableScan implements TableScan {
     return ops;
   }
 
+  protected Schema tableSchema() {
+    return schema;
+  }
+
   protected Long snapshotId() {
     return context.snapshotId();
   }
@@ -85,22 +88,23 @@ abstract class BaseTableScan implements TableScan {
     return context.selectedColumns();
   }
 
+  protected ExecutorService planExecutor() {
+    return context.planExecutor();
+  }
+
   protected Map<String, String> options() {
     return context.options();
   }
 
-  protected  TableScanContext context() {
+  protected TableScanContext context() {
     return context;
   }
 
   @SuppressWarnings("checkstyle:HiddenField")
-  protected abstract TableScan newRefinedScan(
-      TableOperations ops, Table table, Schema schema, TableScanContext context);
+  protected abstract TableScan newRefinedScan(TableOperations ops, Table table, Schema schema,
+                                              TableScanContext context);
 
-  @SuppressWarnings("checkstyle:HiddenField")
-  protected abstract CloseableIterable<FileScanTask> planFiles(
-      TableOperations ops, Snapshot snapshot, Expression rowFilter,
-      boolean ignoreResiduals, boolean caseSensitive, boolean colStats);
+  protected abstract CloseableIterable<FileScanTask> doPlanFiles();
 
   @Override
   public Table table() {
@@ -118,69 +122,55 @@ abstract class BaseTableScan implements TableScan {
   }
 
   @Override
+  public TableScan planWith(ExecutorService executorService) {
+    return newRefinedScan(ops, table, schema, context.planWith(executorService));
+  }
+
+  @Override
   public TableScan useSnapshot(long scanSnapshotId) {
-    Preconditions.checkArgument(context.snapshotId() == null,
-        "Cannot override snapshot, already set to id=%s", context.snapshotId());
+    Preconditions.checkArgument(snapshotId() == null,
+        "Cannot override snapshot, already set to id=%s", snapshotId());
     Preconditions.checkArgument(ops.current().snapshot(scanSnapshotId) != null,
         "Cannot find snapshot with ID %s", scanSnapshotId);
-    return newRefinedScan(
-        ops, table, schema, context.useSnapshotId(scanSnapshotId));
+    return newRefinedScan(ops, table, schema, context.useSnapshotId(scanSnapshotId));
   }
 
   @Override
   public TableScan asOfTime(long timestampMillis) {
-    Preconditions.checkArgument(context.snapshotId() == null,
-        "Cannot override snapshot, already set to id=%s", context.snapshotId());
+    Preconditions.checkArgument(snapshotId() == null,
+        "Cannot override snapshot, already set to id=%s", snapshotId());
 
-    Long lastSnapshotId = null;
-    for (HistoryEntry logEntry : ops.current().snapshotLog()) {
-      if (logEntry.timestampMillis() <= timestampMillis) {
-        lastSnapshotId = logEntry.snapshotId();
-      }
-    }
-
-    // the snapshot ID could be null if no entries were older than the requested time. in that case,
-    // there is no valid snapshot to read.
-    Preconditions.checkArgument(lastSnapshotId != null,
-        "Cannot find a snapshot older than %s", formatTimestampMillis(timestampMillis));
-
-    return useSnapshot(lastSnapshotId);
+    return useSnapshot(SnapshotUtil.snapshotIdAsOfTime(table(), timestampMillis));
   }
 
   @Override
   public TableScan option(String property, String value) {
-    return newRefinedScan(
-        ops, table, schema, context.withOption(property, value));
+    return newRefinedScan(ops, table, schema, context.withOption(property, value));
   }
 
   @Override
   public TableScan project(Schema projectedSchema) {
-    return newRefinedScan(
-        ops, table, schema, context.project(projectedSchema));
+    return newRefinedScan(ops, table, schema, context.project(projectedSchema));
   }
 
   @Override
   public TableScan caseSensitive(boolean scanCaseSensitive) {
-    return newRefinedScan(
-        ops, table, schema, context.setCaseSensitive(scanCaseSensitive));
+    return newRefinedScan(ops, table, schema, context.setCaseSensitive(scanCaseSensitive));
   }
 
   @Override
   public TableScan includeColumnStats() {
-    return newRefinedScan(
-        ops, table, schema, context.shouldReturnColumnStats(true));
+    return newRefinedScan(ops, table, schema, context.shouldReturnColumnStats(true));
   }
 
   @Override
   public TableScan select(Collection<String> columns) {
-    return newRefinedScan(
-        ops, table, schema, context.selectColumns(columns));
+    return newRefinedScan(ops, table, schema, context.selectColumns(columns));
   }
 
   @Override
   public TableScan filter(Expression expr) {
-    return newRefinedScan(ops, table, schema,
-        context.filterRows(Expressions.and(context.rowFilter(), expr)));
+    return newRefinedScan(ops, table, schema, context.filterRows(Expressions.and(filter(), expr)));
   }
 
   @Override
@@ -190,8 +180,7 @@ abstract class BaseTableScan implements TableScan {
 
   @Override
   public TableScan ignoreResiduals() {
-    return newRefinedScan(
-        ops, table, schema, context.ignoreResiduals(true));
+    return newRefinedScan(ops, table, schema, context.ignoreResiduals(true));
   }
 
   @Override
@@ -199,14 +188,12 @@ abstract class BaseTableScan implements TableScan {
     Snapshot snapshot = snapshot();
     if (snapshot != null) {
       LOG.info("Scanning table {} snapshot {} created at {} with filter {}", table,
-          snapshot.snapshotId(), formatTimestampMillis(snapshot.timestampMillis()),
-          context.rowFilter());
+          snapshot.snapshotId(), DateTimeUtil.formatTimestampMillis(snapshot.timestampMillis()),
+          ExpressionUtil.toSanitizedString(filter()));
 
-      Listeners.notifyAll(
-          new ScanEvent(table.name(), snapshot.snapshotId(), context.rowFilter(), schema()));
+      Listeners.notifyAll(new ScanEvent(table.name(), snapshot.snapshotId(), filter(), schema()));
 
-      return planFiles(ops, snapshot,
-          context.rowFilter(), context.ignoreResiduals(), context.caseSensitive(), context.returnColumnStats());
+      return doPlanFiles();
 
     } else {
       LOG.info("Scanning empty table {}", table);
@@ -216,31 +203,25 @@ abstract class BaseTableScan implements TableScan {
 
   @Override
   public CloseableIterable<CombinedScanTask> planTasks() {
-    Map<String, String> options = context.options();
-    long splitSize;
-    if (options.containsKey(TableProperties.SPLIT_SIZE)) {
-      splitSize = Long.parseLong(options.get(TableProperties.SPLIT_SIZE));
-    } else {
-      splitSize = targetSplitSize();
-    }
-    int lookback;
-    if (options.containsKey(TableProperties.SPLIT_LOOKBACK)) {
-      lookback = Integer.parseInt(options.get(TableProperties.SPLIT_LOOKBACK));
-    } else {
-      lookback = ops.current().propertyAsInt(
-          TableProperties.SPLIT_LOOKBACK, TableProperties.SPLIT_LOOKBACK_DEFAULT);
-    }
-    long openFileCost;
-    if (options.containsKey(TableProperties.SPLIT_OPEN_FILE_COST)) {
-      openFileCost = Long.parseLong(options.get(TableProperties.SPLIT_OPEN_FILE_COST));
-    } else {
-      openFileCost = ops.current().propertyAsLong(
-          TableProperties.SPLIT_OPEN_FILE_COST, TableProperties.SPLIT_OPEN_FILE_COST_DEFAULT);
-    }
-
     CloseableIterable<FileScanTask> fileScanTasks = planFiles();
-    CloseableIterable<FileScanTask> splitFiles = TableScanUtil.splitFiles(fileScanTasks, splitSize);
-    return TableScanUtil.planTasks(splitFiles, splitSize, lookback, openFileCost);
+    CloseableIterable<FileScanTask> splitFiles = TableScanUtil.splitFiles(fileScanTasks, targetSplitSize());
+    return TableScanUtil.planTasks(splitFiles, targetSplitSize(), splitLookback(), splitOpenFileCost());
+  }
+
+  @Override
+  public int splitLookback() {
+    int tableValue = tableOps().current().propertyAsInt(
+        TableProperties.SPLIT_LOOKBACK,
+        TableProperties.SPLIT_LOOKBACK_DEFAULT);
+    return PropertyUtil.propertyAsInt(options(), TableProperties.SPLIT_LOOKBACK, tableValue);
+  }
+
+  @Override
+  public long splitOpenFileCost() {
+    long tableValue = tableOps().current().propertyAsLong(
+        TableProperties.SPLIT_OPEN_FILE_COST,
+        TableProperties.SPLIT_OPEN_FILE_COST_DEFAULT);
+    return PropertyUtil.propertyAsLong(options(), TableProperties.SPLIT_OPEN_FILE_COST, tableValue);
   }
 
   @Override
@@ -250,8 +231,8 @@ abstract class BaseTableScan implements TableScan {
 
   @Override
   public Snapshot snapshot() {
-    return context.snapshotId() != null ?
-        ops.current().snapshot(context.snapshotId()) :
+    return snapshotId() != null ?
+        ops.current().snapshot(snapshotId()) :
         ops.current().currentSnapshot();
   }
 
@@ -265,9 +246,9 @@ abstract class BaseTableScan implements TableScan {
     return MoreObjects.toStringHelper(this)
         .add("table", table)
         .add("projection", schema().asStruct())
-        .add("filter", context.rowFilter())
-        .add("ignoreResiduals", context.ignoreResiduals())
-        .add("caseSensitive", context.caseSensitive())
+        .add("filter", filter())
+        .add("ignoreResiduals", shouldIgnoreResiduals())
+        .add("caseSensitive", isCaseSensitive())
         .toString();
   }
 
@@ -278,34 +259,29 @@ abstract class BaseTableScan implements TableScan {
    * @return the Schema to project
    */
   private Schema lazyColumnProjection() {
-    Collection<String> selectedColumns = context.selectedColumns();
-    if (selectedColumns != null) {
+    if (selectedColumns() != null) {
       Set<Integer> requiredFieldIds = Sets.newHashSet();
 
       // all of the filter columns are required
       requiredFieldIds.addAll(
           Binder.boundReferences(schema.asStruct(),
-              Collections.singletonList(context.rowFilter()), context.caseSensitive()));
+              Collections.singletonList(filter()), isCaseSensitive()));
 
       // all of the projection columns are required
       Set<Integer> selectedIds;
-      if (context.caseSensitive()) {
-        selectedIds = TypeUtil.getProjectedIds(schema.select(selectedColumns));
+      if (isCaseSensitive()) {
+        selectedIds = TypeUtil.getProjectedIds(schema.select(selectedColumns()));
       } else {
-        selectedIds = TypeUtil.getProjectedIds(schema.caseInsensitiveSelect(selectedColumns));
+        selectedIds = TypeUtil.getProjectedIds(schema.caseInsensitiveSelect(selectedColumns()));
       }
       requiredFieldIds.addAll(selectedIds);
 
-      return TypeUtil.select(schema, requiredFieldIds);
+      return TypeUtil.project(schema, requiredFieldIds);
 
     } else if (context.projectedSchema() != null) {
       return context.projectedSchema();
     }
 
     return schema;
-  }
-
-  private static String formatTimestampMillis(long millis) {
-    return DATE_FORMAT.format(LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault()));
   }
 }

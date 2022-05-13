@@ -35,57 +35,6 @@ public abstract class BaseMetastoreCatalog implements Catalog {
   private static final Logger LOG = LoggerFactory.getLogger(BaseMetastoreCatalog.class);
 
   @Override
-  public Table createTable(
-      TableIdentifier identifier,
-      Schema schema,
-      PartitionSpec spec,
-      String location,
-      Map<String, String> properties) {
-
-    return buildTable(identifier, schema)
-        .withPartitionSpec(spec)
-        .withLocation(location)
-        .withProperties(properties)
-        .create();
-  }
-
-  @Override
-  public Transaction newCreateTableTransaction(
-      TableIdentifier identifier,
-      Schema schema,
-      PartitionSpec spec,
-      String location,
-      Map<String, String> properties) {
-
-    return buildTable(identifier, schema)
-        .withPartitionSpec(spec)
-        .withLocation(location)
-        .withProperties(properties)
-        .createTransaction();
-  }
-
-  @Override
-  public Transaction newReplaceTableTransaction(
-      TableIdentifier identifier,
-      Schema schema,
-      PartitionSpec spec,
-      String location,
-      Map<String, String> properties,
-      boolean orCreate) {
-
-    TableBuilder tableBuilder = buildTable(identifier, schema)
-        .withPartitionSpec(spec)
-        .withLocation(location)
-        .withProperties(properties);
-
-    if (orCreate) {
-      return tableBuilder.createOrReplaceTransaction();
-    } else {
-      return tableBuilder.replaceTransaction();
-    }
-  }
-
-  @Override
   public Table loadTable(TableIdentifier identifier) {
     Table result;
     if (isValidIdentifier(identifier)) {
@@ -247,7 +196,7 @@ public abstract class BaseMetastoreCatalog implements Catalog {
     private Transaction newReplaceTableTransaction(boolean orCreate) {
       TableOperations ops = newTableOps(identifier);
       if (!orCreate && ops.current() == null) {
-        throw new NoSuchTableException("No such table: %s", identifier);
+        throw new NoSuchTableException("Table does not exist: %s", identifier);
       }
 
       TableMetadata metadata;

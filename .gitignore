@@ -2,6 +2,7 @@
 .DS_Store
 .cache
 tmp/
+site
 
 # intellij files
 .idea
@@ -9,6 +10,7 @@ tmp/
 *.ipr
 *.iws
 *.iml
+out
 
 # gradle build
 .gradle
@@ -26,10 +28,11 @@ lib/
 site/site
 
 # benchmark output
-spark2/benchmark/*
-!spark2/benchmark/.gitkeep
-spark3/benchmark/*
-!spark3/benchmark/.gitkeep
+spark/v2.4/spark/benchmark/*
+spark/v3.0/spark/benchmark/*
+spark/v3.1/spark/benchmark/*
+spark/v3.2/spark/benchmark/*
+data/benchmark/*
 
 __pycache__/
 *.py[cod]
@@ -60,4 +63,5 @@ spark-warehouse/
 derby.log
 
 # Python stuff
+python_legacy/.mypy_cache/
 python/.mypy_cache/

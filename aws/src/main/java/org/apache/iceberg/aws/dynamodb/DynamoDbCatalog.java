@@ -44,6 +44,7 @@ import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
@@ -51,6 +52,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.util.Tasks;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -109,6 +111,7 @@ public class DynamoDbCatalog extends BaseMetastoreCatalog implements Closeable, 
   private String warehousePath;
   private AwsProperties awsProperties;
   private FileIO fileIO;
+  private CloseableGroup closeableGroup;
 
   public DynamoDbCatalog() {
   }
@@ -125,11 +128,20 @@ public class DynamoDbCatalog extends BaseMetastoreCatalog implements Closeable, 
 
   @VisibleForTesting
   void initialize(String name, String path, AwsProperties properties, DynamoDbClient client, FileIO io) {
+    Preconditions.checkArgument(path != null && path.length() > 0,
+        "Cannot initialize DynamoDbCatalog because warehousePath must not be null or empty");
+
     this.catalogName = name;
     this.awsProperties = properties;
-    this.warehousePath = cleanWarehousePath(path);
+    this.warehousePath = LocationUtil.stripTrailingSlash(path);
     this.dynamo = client;
     this.fileIO = io;
+
+    this.closeableGroup = new CloseableGroup();
+    closeableGroup.addCloseable(dynamo);
+    closeableGroup.addCloseable(fileIO);
+    closeableGroup.setSuppressCloseFailure(true);
+
     ensureCatalogTableExistsOrCreate();
   }
 
@@ -248,7 +260,7 @@ public class DynamoDbCatalog extends BaseMetastoreCatalog implements Closeable, 
       dynamo.deleteItem(DeleteItemRequest.builder()
           .tableName(awsProperties.dynamoDbTableName())
           .key(namespacePrimaryKey(namespace))
-          .conditionExpression("attribute_exists(" + namespace + ")")
+          .conditionExpression("attribute_exists(" + COL_NAMESPACE + ")")
           .build());
       return true;
     } catch (ConditionalCheckFailedException e) {
@@ -429,7 +441,7 @@ public class DynamoDbCatalog extends BaseMetastoreCatalog implements Closeable, 
 
   @Override
   public void close() throws IOException {
-    dynamo.close();
+    closeableGroup.close();
   }
 
   /**
@@ -490,17 +502,6 @@ public class DynamoDbCatalog extends BaseMetastoreCatalog implements Closeable, 
       return io;
     } else {
       return CatalogUtil.loadFileIO(fileIOImpl, properties, hadoopConf);
-    }
-  }
-
-  private String cleanWarehousePath(String path) {
-    Preconditions.checkArgument(path != null && path.length() > 0,
-        "Cannot initialize DynamoDbCatalog because warehousePath must not be null");
-    int len = path.length();
-    if (path.charAt(len - 1) == '/') {
-      return path.substring(0, len - 1);
-    } else {
-      return path;
     }
   }
 
